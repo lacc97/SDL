@@ -25,6 +25,16 @@ pub fn build(b: *std.Build) void {
             lib.linkSystemLibrary("version");
             lib.linkSystemLibrary("oleaut32");
             lib.linkSystemLibrary("ole32");
+
+            const config_header_step = b.addWriteFiles();
+            _ = config_header_step.addCopyFile(std.Build.LazyPath.relative("include/SDL_config.h.default"), "SDL_config.h");
+            lib.addIncludePath(config_header_step.getDirectory());
+            lib.installHeadersDirectoryOptions(.{
+                .source_dir = config_header_step.getDirectory(),
+                .install_dir = .header,
+                .install_subdir = "SDL2",
+                .exclude_extensions = &.{},
+            });
         },
         .macos => {
             lib.addCSourceFiles(&darwin_src_files, &.{});
@@ -40,21 +50,89 @@ pub fn build(b: *std.Build) void {
             lib.linkFramework("AudioToolbox");
             lib.linkFramework("AVFoundation");
             lib.linkFramework("Foundation");
+
+            const config_header_step = b.addWriteFiles();
+            _ = config_header_step.addCopyFile(std.Build.LazyPath.relative("include/SDL_config.h.default"), "SDL_config.h");
+            lib.addIncludePath(config_header_step.getDirectory());
+            lib.installHeadersDirectoryOptions(.{
+                .source_dir = config_header_step.getDirectory(),
+                .install_dir = .header,
+                .install_subdir = "SDL2",
+                .exclude_extensions = &.{},
+            });
         },
         else => {
+            const audio_driver_jack = @intFromBool(t.os.tag == .linux);
+            const audio_driver_pipewire = @intFromBool(t.os.tag == .linux);
+            const audio_driver_pulseaudio = @intFromBool(t.os.tag == .linux);
+
+            const video_driver_wayland: i64 = @intFromBool(t.os.tag == .linux);
+            const video_driver_x11: i64 = @intFromBool(t.os.tag == .linux or t.os.tag.isBSD());
+
             const config_header = b.addConfigHeader(.{
                 .style = .{ .cmake = .{ .path = "include/SDL_config.h.cmake" } },
-                .include_path = "SDL2/SDL_config.h",
-            }, .{});
+                .include_path = "SDL_config.h",
+            }, .{
+                .SDL_DEFAULT_ASSERT_LEVEL_CONFIGURED = 0,
+
+                .STDC_HEADERS = 1,
+
+                .HAVE_INTTYPES_H = 1,
+                .HAVE_MATH_H = 1,
+                .HAVE_STDARG_H = 1,
+                .HAVE_STDDEF_H = 1,
+                .HAVE_STDINT_H = 1,
+
+                .HAVE_MALLOC = 1,
+                .HAVE_CALLOC = 1,
+                .HAVE_REALLOC = 1,
+                .HAVE_FREE = 1,
+
+                .HAVE_IMMINTRIN_H = @intFromBool(t.cpu.arch == .x86 or t.cpu.arch == .x86_64),
+
+                .HAVE_DBUS_DBUS_H = @intFromBool(t.os.tag == .linux),
+
+                .SDL_AUDIO_DRIVER_JACK = audio_driver_jack,
+                .SDL_AUDIO_DRIVER_JACK_DYNAMIC = audio_driver_jack,
+                .SDL_AUDIO_DRIVER_PIPEWIRE = audio_driver_pipewire,
+                .SDL_AUDIO_DRIVER_PIPEWIRE_DYNAMIC = audio_driver_pipewire,
+                .SDL_AUDIO_DRIVER_PULSEAUDIO = audio_driver_pulseaudio,
+                .SDL_AUDIO_DRIVER_PULSEAUDIO_DYNAMIC = audio_driver_pulseaudio,
+
+                .SDL_THREAD_PTHREAD = @intFromBool(t.os.tag == .linux or t.os.tag.isBSD()),
+
+                .SDL_TIMER_UNIX = @intFromBool(t.os.tag == .linux or t.os.tag.isBSD()),
+
+                .SDL_VIDEO_DRIVER_WAYLAND = video_driver_wayland,
+                .SDL_VIDEO_DRIVER_WAYLAND_DYNAMIC = video_driver_wayland,
+                .SDL_VIDEO_DRIVER_X11 = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_XCURSOR = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_XINPUT2 = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_XFIXES = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_XRANDR = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_XSCREENSAVER = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_DYNAMIC = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_DYNAMIC_XCURSOR = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_DYNAMIC_XINPUT2 = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_DYNAMIC_XFIXES = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_DYNAMIC_XRANDR = video_driver_x11,
+                .SDL_VIDEO_DRIVER_X11_DYNAMIC_XSS = video_driver_x11,
+            });
+            lib.defineCMacro("USING_GENERATED_CONFIG_H", null);
             lib.addConfigHeader(config_header);
-            lib.installConfigHeader(config_header, .{});
+            lib.installConfigHeader(config_header, .{
+                .dest_rel_path = "SDL2/SDL_config.h",
+            });
+
+            if (t.os.tag == .linux) lib.addCSourceFiles(&linux_src_files, &.{});
         },
     }
+
     lib.installHeadersDirectoryOptions(.{
         .source_dir = .{ .path = "include" },
         .install_dir = .header,
         .install_subdir = "SDL2",
-        .exclude_extensions = &.{ ".cmake", ".in" },
+        .exclude_extensions = &.{ ".cmake", ".in", ".default" },
     });
     b.installArtifact(lib);
 }
@@ -636,3 +714,44 @@ const unknown_src_files = [_][]const u8{
     "src/render/vitagxm/SDL_render_vita_gxm_memory.c",
     "src/render/vitagxm/SDL_render_vita_gxm_tools.c",
 };
+
+// --- Helpers ---
+
+pub fn addClosureStep(
+    b: *std.build.Builder,
+    name: []const u8,
+    comptime function: anytype,
+    args: std.meta.Tuple(@typeInfo(@TypeOf(function)).Fn.args),
+) *ClosureStep(function) {
+    return ClosureStep(function).create(b, name, args) catch unreachable;
+}
+
+pub fn ClosureStep(comptime function: anytype) type {
+    const Function = @TypeOf(function);
+    const ArgsTuple = std.meta.ArgsTuple(Function);
+    return struct {
+        const Self = @This();
+        step: std.build.Step,
+        args: ArgsTuple,
+
+        pub fn create(b: *std.Build, name: []const u8, args: ArgsTuple) !*Self {
+            const result = try b.allocator.create(Self);
+            errdefer b.allocator.destroy(result);
+
+            result.args = args;
+            result.step = std.build.Step.init(.{
+                .id = .custom,
+                .name = name,
+                .owner = b,
+                .makeFn = Self.make,
+            });
+
+            return result;
+        }
+
+        pub fn make(step: *std.build.Step) anyerror!void {
+            const self = @fieldParentPtr(Self, "step", step);
+            @call(.{}, function, self.args);
+        }
+    };
+}
